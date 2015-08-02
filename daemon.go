@@ -1,10 +1,6 @@
 package matchboxd
 
-import (
-	"log"
-
-	"github.com/Workiva/matchbox"
-)
+import "github.com/Workiva/matchbox"
 
 const separator = "_"
 
@@ -39,13 +35,16 @@ type zookeeperDaemon struct {
 	mb       matchbox.Matchbox
 	metadata metadataClient
 	zkHosts  []string
+	errors   chan error
 }
 
 // NewDaemon creates a new Daemon backed by Zookeeper.
 func NewDaemon(config *matchbox.Config, zkHosts []string) Daemon {
+	errors := make(chan error, 1)
 	return &zookeeperDaemon{
 		mb:       matchbox.New(config),
-		metadata: newZookeeperMetadataClient(zkHosts),
+		metadata: newZookeeperMetadataClient(zkHosts, errors),
+		errors:   errors,
 	}
 }
 
@@ -62,19 +61,21 @@ func (z *zookeeperDaemon) Close() error {
 }
 
 func (z *zookeeperDaemon) Errors() <-chan error {
-	return z.metadata.Errors()
+	return z.errors
 }
 
 func (z *zookeeperDaemon) Subscribe(topic string, subscriber matchbox.Subscriber) {
 	if err := z.metadata.Subscribe(topic, subscriber.ID()); err != nil {
-		log.Println("matchboxd: %s", err.Error())
+		z.errors <- err
+		return
 	}
 	z.mb.Subscribe(topic, subscriber)
 }
 
 func (z *zookeeperDaemon) Unsubscribe(topic string, subscriber matchbox.Subscriber) {
 	if err := z.metadata.Unsubscribe(topic, subscriber.ID()); err != nil {
-		log.Println("matchboxd: %s", err.Error())
+		z.errors <- err
+		return
 	}
 	z.mb.Unsubscribe(topic, subscriber)
 }

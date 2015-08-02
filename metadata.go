@@ -29,11 +29,11 @@ type zkMetadataClient struct {
 	closed chan bool
 }
 
-func newZookeeperMetadataClient(hosts []string) metadataClient {
+func newZookeeperMetadataClient(hosts []string, errors chan error) metadataClient {
 	return &zkMetadataClient{
 		hosts:  hosts,
 		events: make(chan *Subscriber, 1024),
-		errors: make(chan error, 1),
+		errors: errors,
 		closed: make(chan bool, 1),
 	}
 }
