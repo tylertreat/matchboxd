@@ -3,6 +3,7 @@ package matchboxd
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/samuel/go-zookeeper/zk"
@@ -22,19 +23,22 @@ type metadataClient interface {
 }
 
 type zkMetadataClient struct {
-	conn   *zk.Conn
-	hosts  []string
-	events chan *Subscriber
-	errors chan error
-	closed chan bool
+	conn    *zk.Conn
+	hosts   []string
+	events  chan *Subscriber
+	errors  chan error
+	closed  chan bool
+	watches map[string]bool
+	mu      sync.RWMutex
 }
 
 func newZookeeperMetadataClient(hosts []string, errors chan error) metadataClient {
 	return &zkMetadataClient{
-		hosts:  hosts,
-		events: make(chan *Subscriber, 1024),
-		errors: errors,
-		closed: make(chan bool, 1),
+		hosts:   hosts,
+		events:  make(chan *Subscriber, 1024),
+		errors:  errors,
+		closed:  make(chan bool, 1),
+		watches: make(map[string]bool),
 	}
 }
 
@@ -85,26 +89,44 @@ func (z *zkMetadataClient) Unsubscribe(topic string, id string) error {
 	return err
 }
 
-func (z *zkMetadataClient) watchSubscription(topic, id, path string) {
+func (z *zkMetadataClient) watchSubscription(topic, id, path string) bool {
+	z.mu.RLock()
+	if _, ok := z.watches[path]; ok {
+		z.mu.RUnlock()
+		return false
+	}
+	z.mu.RUnlock()
 	_, _, events, err := z.conn.ExistsW(path)
 	if err != nil {
 		z.errors <- err
-		return
+		return false
 	}
 
-	event := <-events
-	if event.Err != nil {
-		z.errors <- event.Err
-		return
-	}
+	z.mu.Lock()
+	z.watches[path] = true
+	z.mu.Unlock()
 
-	if event.Type == zk.EventNodeDeleted {
-		z.events <- &Subscriber{
-			removed:      true,
-			topic:        topic,
-			SubscriberID: id,
+	go func() {
+		event := <-events
+		if event.Err != nil {
+			z.errors <- event.Err
+			return
 		}
-	}
+
+		if event.Type == zk.EventNodeDeleted {
+			z.events <- &Subscriber{
+				removed:      true,
+				topic:        topic,
+				SubscriberID: id,
+			}
+		}
+
+		z.mu.Lock()
+		delete(z.watches, path)
+		z.mu.Unlock()
+	}()
+
+	return true
 }
 
 func (z *zkMetadataClient) sync() {
@@ -116,11 +138,12 @@ func (z *zkMetadataClient) sync() {
 		}
 		for _, sub := range subs {
 			topicAndSubscriber := strings.Split(sub, separator)
-			go z.watchSubscription(topicAndSubscriber[0], topicAndSubscriber[1],
-				fmt.Sprintf("%s/%s", zMatchbox, sub))
-			z.events <- &Subscriber{
-				topic:        topicAndSubscriber[0],
-				SubscriberID: topicAndSubscriber[1],
+			if z.watchSubscription(topicAndSubscriber[0], topicAndSubscriber[1],
+				fmt.Sprintf("%s/%s", zMatchbox, sub)) {
+				z.events <- &Subscriber{
+					topic:        topicAndSubscriber[0],
+					SubscriberID: topicAndSubscriber[1],
+				}
 			}
 		}
 
